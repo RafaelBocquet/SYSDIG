@@ -1,5 +1,5 @@
 {-# LANGUAGE RankNTypes, DataKinds, KindSignatures, GADTs, EmptyDataDecls, FlexibleContexts, FlexibleInstances, MultiParamTypeClasses, FunctionalDependencies, TypeOperators, TypeFamilies, Arrows, ViewPatterns, AllowAmbiguousTypes, UndecidableInstances, ScopedTypeVariables, IncoherentInstances #-}
-module A where
+module Main where
 
 import Prelude hiding (id, (.))
 
@@ -11,31 +11,61 @@ import Control.Arrow
 import Data.Proxy
 import Unsafe.Coerce
 
+import Data.Type.Equality
+
+import qualified GHC.TypeLits as GHC
+
 -- Nats
 
 data Nat = Zero | Succ Nat
 
-type family (a :: Nat) + (b :: Nat) :: Nat
-type instance Zero   + b = b
-type instance Succ a + b = Succ (a + b)
+data SNat :: Nat -> * where
+  SZero :: SNat Zero
+  SSucc :: SNat n -> SNat (Succ n)
 
-type family (a :: Nat) - (b :: Nat) :: Nat
-type instance a - Zero        = a
-type instance Zero - a        = Zero
-type instance Succ a - Succ b = a - b
+type family (a :: Nat) + (b :: Nat) :: Nat where
+  Zero   + b = b
+  Succ a + b = Succ (a + b)
 
-type family (a :: Nat) * (b :: Nat) :: Nat
-type instance Zero     * b = Zero
-type instance (Succ a) * b = b + (a * b)
+(%+) :: SNat a -> SNat b -> SNat (a + b)
+SZero   %+ b = b
+SSucc a %+ b = SSucc (a %+ b)
 
-type family (a :: Nat) ^ (b :: Nat) :: Nat
-type instance a ^ Zero   = Succ Zero
-type instance a ^ Succ b = a * (a ^ b)
+plusAssociative :: SNat a -> SNat b -> SNat c -> ((a+b)+c) :~: (a+(b+c))
+plusAssociative SZero b c     = Refl
+plusAssociative (SSucc a) b c = case plusAssociative a b c of
+  Refl -> Refl
 
-type family Half (a :: Nat) :: Nat
-type instance Half Zero            = Zero
-type instance Half (Succ Zero)     = Zero
-type instance Half (Succ (Succ a)) = Succ (Half a)
+plus_0_right_neutral :: SNat a -> (a + Zero) :~: a
+plus_0_right_neutral SZero     = Refl
+plus_0_right_neutral (SSucc a) = case plus_0_right_neutral a of
+  Refl -> Refl
+
+type family (a :: Nat) - (b :: Nat) :: Nat where
+  a      - Zero   = a
+  Zero   - a      = Zero
+  Succ a - Succ b = a - b
+
+type family (a :: Nat) * (b :: Nat) :: Nat where
+  Zero   * b = Zero
+  Succ a * b = b + (a * b)
+
+(%*) :: SNat a -> SNat b -> SNat (a * b)
+SZero   %* _ = SZero
+SSucc a %* b = b %+ (a %* b)
+
+type family (a :: Nat) ^ (b :: Nat) :: Nat where
+  a ^ Zero   = Succ Zero
+  a ^ Succ b = a * (a ^ b)
+
+(%^) :: SNat a -> SNat b -> SNat (a ^ b)
+a %^ SZero   = SSucc SZero
+a %^ SSucc b = a %* (a %^ b)
+
+type family Half (a :: Nat) :: Nat where
+  Half Zero            = Zero
+  Half (Succ Zero)     = Zero
+  Half (Succ (Succ a)) = Succ (Half a)
 
 -- Vector
 
@@ -115,17 +145,23 @@ instance BitWise (BitVector' n) where
         SBitVector' zs <- bitwise c -$- (SBitVector' xs :.: SBitVector' ys)
         return $ SBitVector' (z :> zs)
 
-class ViewBV (n :: Nat) (a :: Nat) where
-  viewBV :: Signal (BitVector' n) -> (Signal (BitVector' a), Signal (BitVector' (n - a)))
-instance ViewBV n Zero where
-  viewBV (SBitVector' xs) = (SBitVector' Nil, SBitVector' xs)
-instance ViewBV Zero a where
-instance ViewBV (Succ n) (Succ a) where
-  viewBV (SBitVector' (x :> xs)) =
-    let (SBitVector' ys, zs) = viewBV (SBitVector' xs) in
-     (SBitVector' (x :> ys), zs)
-instance ViewBV n a where
+-- class ViewBV (n :: Nat) (a :: Nat) where
+--   viewBV :: Signal (BitVector' n) -> (Signal (BitVector' a), Signal (BitVector' (n - a)))
+-- instance ViewBV n Zero where
+--   viewBV (SBitVector' xs) = (SBitVector' Nil, SBitVector' xs)
+-- instance ViewBV Zero a where
+-- instance ViewBV (Succ n) (Succ a) where
+--   viewBV (SBitVector' (x :> xs)) =
+--     let (SBitVector' ys, zs) = viewBV (SBitVector' xs) in
+--      (SBitVector' (x :> ys), zs)
+-- instance ViewBV n a where
 
+viewBV :: SNat a -> SNat b -> Signal (BitVector' (a + b)) -> (Signal (BitVector' a), Signal (BitVector' b))
+viewBV SZero _     bv                      = (SBitVector' Nil, bv)
+viewBV (SSucc a) b (SBitVector' (x :> xs)) =
+  case viewBV a b (SBitVector' xs) of
+   (SBitVector' ys, bv') -> (SBitVector' (x :> ys), bv')
+                   
 -- -- Circuit
 
 type Circuit m a b = CircuitA m (Signal a) (Signal b)
@@ -138,6 +174,12 @@ infixr 4 -&-
 (-&-) :: Monad m => Circuit m a b -> Circuit m a c -> Circuit m a (b :.: c)
 a -&- b = CircuitA $ \x -> do
   (a', b') <- a &&& b -$- x
+  return (a' :.: b')
+  
+infixr 4 -*-
+(-*-) :: Monad m => Circuit m a c -> Circuit m b d -> Circuit m (a :.: b) (c :.: d)
+a -*- b = CircuitA $ \(x :.: y) -> do
+  (a', b') <- a *** b -$- (x, y)
   return (a' :.: b')
 
 class (Applicative m, Monad m) => CircuitMonad m where
@@ -185,17 +227,32 @@ class (Applicative m, Monad m) => CircuitMonad m where
 -- mux = CircuitA $ \(a :.: b :.: c) -> do
 --   bitwise (proc (x :.: y) -> mux3 -< (a :.: x :.: y)) -$- (b :.: c)
 
-class AllBV (n :: Nat) where
-  allBV :: CircuitMonad m => Circuit m (BitVector' n) Bit
-instance AllBV Zero where
-  allBV = undefined
-instance AllBV (Succ n) where
-  allBV = CircuitA $ \(viewBV -> (xs :: Signal (BitVector' (Half (Succ n))), unsafeCoerce -> ys :: Signal (BitVector' (Half (Succ n))))) -> do
-    x <- allBV -$- xs
-    y <- allBV -$- ys
-    and2 -$- x :.: y
-instance AllBV n where
+two = SSucc (SSucc SZero)
+four = two %+ two
 
-pou :: CircuitMonad m => Circuit m (BitVector' (Succ (Succ Zero))) Bit
-pou = allBV
+allBV :: CircuitMonad m => SNat n -> Circuit m (BitVector' (Succ (Succ Zero) ^ n)) Bit
+allBV SZero     = CircuitA $ \(SBitVector' (x :> Nil)) -> return x
+allBV (SSucc n) =
+  case plus_0_right_neutral ((two %^ n) %+ (two %^ n)) of
+   Refl -> case plusAssociative (two %^ n) (two %^ n) SZero of
+            Refl -> proc (viewBV (two %^ n) (two %^ n) -> (a, b)) -> do
+              and2 . (allBV n -*- allBV n)  -< a :.: b
 
+pouet :: CircuitMonad m => Circuit m (BitVector' (Succ (Succ (Succ (Succ Zero))))) Bit
+pouet = allBV two
+
+instance CircuitMonad IO where
+  zero = CircuitA $ \SEmpty -> do
+    putStrLn "zero"
+    return (SBit 0)
+  one = CircuitA $ \SEmpty -> do
+    putStrLn "one"
+    return (SBit 1)
+  and2 = CircuitA $ \(SBit x :.: SBit y) -> do
+    putStrLn "and"
+    return (SBit (x + y))
+
+main :: IO ()
+main = do
+  pouet -$- SBitVector' (SBit 5 :> SBit 4 :> SBit 9 :> SBit 46 :> Nil)
+  return ()
